@@ -785,6 +785,8 @@ def test_default_spawn_uses_claude_cli_without_provider_fallback(kanban_home, mo
 
     assert kbd._default_spawn(task, str(workspace)) == 42424
     assert captured["cmd"][:2] == ["node", "claude-cli.js"]
+    assert "-p" in captured["cmd"]
+    assert "--print" not in captured["cmd"]
     assert "--model" in captured["cmd"]
     assert "sonnet" in captured["cmd"]
     assert "--fallback-model" not in captured["cmd"]

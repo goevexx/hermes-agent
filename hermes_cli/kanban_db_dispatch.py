@@ -2485,7 +2485,7 @@ def _resolve_claude_cli_argv() -> list[str]:
 def _claude_worker_argv(model: str, permission_mode: str) -> list[str]:
     cmd = [
         *_resolve_claude_cli_argv(),
-        "--print",
+        "-p",
         "--input-format", "text",
         "--output-format", "text",
         "--permission-mode", permission_mode,
