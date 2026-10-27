@@ -1752,6 +1752,11 @@ DEFAULT_CONFIG = {
         # Auto-block after this many consecutive non-success attempts (spawn_failed, timed_out,
         # crashed) for the same task/profile. Reassignment resets the streak.
         "failure_limit": 2,
+        # Worker execution backend. ``claude_cli`` uses local Claude Code first-party auth and
+        # fails closed: it never falls back to a Hermes model provider.
+        "worker_backend": "hermes",
+        "claude_cli_model": "sonnet",
+        "claude_cli_permission_mode": "auto",
         # Worker stdout/stderr log rotation at spawn time (2 MiB + one backup). Raise to keep more
         # early failure evidence from long-running workers.
         "worker_log_rotate_bytes": 2 * 1024 * 1024,

@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import os
 import re
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -2435,6 +2436,96 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     return cmd
 
 
+def _worker_backend_config() -> tuple[str, str, str]:
+    """Return the fail-closed Kanban worker backend configuration.
+
+    ``claude_cli`` launches the locally installed Claude Code executable with
+    its first-party authentication. It never falls back to a Hermes provider.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        kanban_cfg = load_config().get("kanban") or {}
+    except Exception as exc:
+        raise RuntimeError(f"could not load Kanban worker backend config: {exc}") from exc
+    backend = str(kanban_cfg.get("worker_backend") or "hermes").strip().lower()
+    if backend not in {"hermes", "claude_cli"}:
+        raise RuntimeError(
+            f"unsupported kanban.worker_backend {backend!r}; "
+            "refusing to fall back to a model provider"
+        )
+    model = str(kanban_cfg.get("claude_cli_model") or "sonnet").strip()
+    permission_mode = str(
+        kanban_cfg.get("claude_cli_permission_mode") or "auto"
+    ).strip()
+    return backend, model, permission_mode
+
+
+def _resolve_claude_cli_argv() -> list[str]:
+    """Resolve Claude Code without invoking the lossy Windows npm CMD shim."""
+    claude = shutil.which("claude")
+    if not claude:
+        raise RuntimeError(
+            "kanban.worker_backend is claude_cli but `claude` is not on PATH; "
+            "refusing to fall back to Hermes/Codex"
+        )
+    claude_path = Path(claude)
+    if _kb._IS_WINDOWS and claude_path.suffix.lower() in {".cmd", ".bat"}:
+        node = shutil.which("node")
+        cli_js = claude_path.parent / "node_modules" / "@anthropic-ai" / "claude-code" / "cli.js"
+        if not node or not cli_js.is_file():
+            raise RuntimeError(
+                "Claude Code's Windows Node entrypoint could not be resolved; "
+                "refusing to use the npm CMD shim or fall back to Hermes/Codex"
+            )
+        return [node, str(cli_js)]
+    return [claude]
+
+
+def _claude_worker_argv(model: str, permission_mode: str) -> list[str]:
+    cmd = [
+        *_resolve_claude_cli_argv(),
+        "--print",
+        "--input-format", "text",
+        "--output-format", "text",
+        "--permission-mode", permission_mode,
+        "--model", model,
+    ]
+    return cmd
+
+
+def _claude_worker_prompt(task: Task, board: Optional[str], workspace: str) -> str:
+    with contextlib.closing(_kbc.connect(board=board)) as conn:
+        worker_context = _kb.build_worker_context(conn, task.id)
+    board_slug = _kb._normalize_board_slug(board) or _kb.get_current_board()
+    return f"""You are the sole headless Claude Code worker for one Hermes Kanban task.
+
+Work only on task {task.id} in workspace {workspace}. Do not ask an interactive
+question: when human input or unavailable access is genuinely required, block
+the task. Do not invoke another LLM provider, Hermes chat, Codex, OpenRouter, or
+Claude's --fallback-model. Use your current first-party Claude Code session only.
+
+The complete task context follows:
+
+{worker_context}
+
+Lifecycle is mandatory. Before exiting, use Bash to perform exactly one terminal
+transition against board {board_slug!r}:
+
+* Finished and verified:
+  hermes kanban --board {board_slug!r} complete {task.id} --summary '<1-3 sentences>' --metadata '<JSON object>'
+* Same-card review is required and there is no pre-created review child:
+  hermes kanban --board {board_slug!r} request-review {task.id} --summary '<what changed and verification>'
+* Blocked by input, access, Claude rate limit, or another real dependency:
+  hermes kanban --board {board_slug!r} block --kind <needs_input|capability|dependency|transient> {task.id} '<specific reason>'
+
+If Claude itself is rate-limited, block with kind capability and explicitly say
+that a fallback requires the user's prior approval. Never select a fallback.
+Do not report success unless the requested result was actually produced and
+verified. Preserve unrelated repository changes.
+"""
+
+
 def _open_worker_log(task: Task, board: Optional[str]):
     """Append-mode per-task log (a re-run on unblock appends, never overwrites),
     rotated first. Anchored at the board root (not the shared kanban root) so
@@ -2480,7 +2571,7 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
 
 
 def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -> Optional[int]:
-    """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
+    """Fire-and-forget configured Kanban worker subprocess.
 
     Returns the child's PID so the dispatcher can detect crashes before the
     claim TTL expires; completion is still observed via the worker's own
@@ -2591,7 +2682,13 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
-    cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
+    backend, claude_model, claude_permission_mode = _worker_backend_config()
+    claude_prompt: Optional[bytes] = None
+    if backend == "claude_cli":
+        cmd = _claude_worker_argv(claude_model, claude_permission_mode)
+        claude_prompt = _claude_worker_prompt(task, board, workspace).encode("utf-8")
+    else:
+        cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
     # A worker spawned by a managed systemd gateway must leave the gateway's
     # cgroup before startup; otherwise restarting the service kills the worker
     # that is performing the handoff.
@@ -2599,22 +2696,29 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     from tools.process_registry import systemd_user_bus_env
     env = systemd_user_bus_env(env)
     log_f = _open_worker_log(task, board)
+    if backend == "claude_cli":
+        log_f.write(
+            f"[hermes] launching Claude Code CLI backend for kanban task {task.id}\n".encode("utf-8")
+        )
+        log_f.flush()
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,
             cwd=workspace if os.path.isdir(workspace) else None,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.PIPE if claude_prompt is not None else subprocess.DEVNULL,
             stdout=log_f,
             stderr=subprocess.STDOUT,
             env=env,
             start_new_session=True,
             creationflags=subprocess.CREATE_NO_WINDOW if _kb._IS_WINDOWS else 0,
         )
-    except FileNotFoundError:
+        if claude_prompt is not None and proc.stdin is not None:
+            proc.stdin.write(claude_prompt)
+            proc.stdin.close()
+    except (FileNotFoundError, BrokenPipeError):
         log_f.close()
         raise RuntimeError(
-            "`hermes` executable not found on PATH. "
-            "Install Hermes Agent or activate its venv before running the kanban dispatcher."
+            f"failed to start {backend} Kanban worker; no provider fallback was attempted"
         )
     # Intentionally NOT closing log_f: the child keeps writing after return;
     # the OS-level FD stays open in the child until it exits.

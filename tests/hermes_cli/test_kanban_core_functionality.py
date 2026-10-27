@@ -747,6 +747,63 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
     assert env.get("HERMES_PROFILE") == "some-profile"
 
 
+def test_default_spawn_uses_claude_cli_without_provider_fallback(kanban_home, monkeypatch):
+    captured = {}
+
+    class FakeStdin:
+        def write(self, data):
+            captured["prompt"] = data
+
+        def close(self):
+            captured["stdin_closed"] = True
+
+    class FakeProc:
+        pid = 42424
+        stdin = FakeStdin()
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
+        return FakeProc()
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {
+            "worker_backend": "claude_cli",
+            "claude_cli_model": "sonnet",
+            "claude_cli_permission_mode": "auto",
+        }},
+    )
+    monkeypatch.setattr(kbd, "_resolve_claude_cli_argv", lambda: ["node", "claude-cli.js"])
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="Claude backend test", assignee="researcher")
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    workspace = kbw.resolve_workspace(task)
+
+    assert kbd._default_spawn(task, str(workspace)) == 42424
+    assert captured["cmd"][:2] == ["node", "claude-cli.js"]
+    assert "--model" in captured["cmd"]
+    assert "sonnet" in captured["cmd"]
+    assert "--fallback-model" not in captured["cmd"]
+    assert captured["kwargs"]["stdin"] is subprocess.PIPE
+    prompt = captured["prompt"].decode("utf-8")
+    assert tid in prompt
+    assert "Never select a fallback" in prompt
+    assert captured["stdin_closed"] is True
+
+
+def test_unknown_worker_backend_fails_closed(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"worker_backend": "openai-codex"}},
+    )
+    with pytest.raises(RuntimeError, match="refusing to fall back"):
+        kbd._worker_backend_config()
+
+
 # ---------------------------------------------------------------------------
 # Per-task force-loaded skills
 # ---------------------------------------------------------------------------
