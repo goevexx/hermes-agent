@@ -806,6 +806,29 @@ def test_unknown_worker_backend_fails_closed(monkeypatch):
         kbd._worker_backend_config()
 
 
+def test_windows_claude_resolution_executes_literal_claude_command(monkeypatch):
+    monkeypatch.setattr(kbd._kb, "_IS_WINDOWS", True)
+    monkeypatch.setattr(
+        kbd.shutil,
+        "which",
+        lambda name: {
+            "claude": r"C:\npm\claude.CMD",
+            "bash": r"C:\Program Files\Git\usr\bin\bash.exe",
+        }.get(name),
+    )
+
+    argv = kbd._resolve_claude_cli_argv()
+    assert argv == [
+        r"C:\Program Files\Git\usr\bin\bash.exe",
+        "-lc",
+        'exec claude "$@"',
+        "claude",
+    ]
+    worker_argv = kbd._claude_worker_argv("sonnet", "auto")
+    assert worker_argv[:4] == argv
+    assert worker_argv[4] == "-p"
+
+
 # ---------------------------------------------------------------------------
 # Per-task force-loaded skills
 # ---------------------------------------------------------------------------

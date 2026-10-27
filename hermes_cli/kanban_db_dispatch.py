@@ -2462,7 +2462,7 @@ def _worker_backend_config() -> tuple[str, str, str]:
 
 
 def _resolve_claude_cli_argv() -> list[str]:
-    """Resolve Claude Code without invoking the lossy Windows npm CMD shim."""
+    """Resolve the literal ``claude`` CLI command cross-platform."""
     claude = shutil.which("claude")
     if not claude:
         raise RuntimeError(
@@ -2471,14 +2471,16 @@ def _resolve_claude_cli_argv() -> list[str]:
         )
     claude_path = Path(claude)
     if _kb._IS_WINDOWS and claude_path.suffix.lower() in {".cmd", ".bat"}:
-        node = shutil.which("node")
-        cli_js = claude_path.parent / "node_modules" / "@anthropic-ai" / "claude-code" / "cli.js"
-        if not node or not cli_js.is_file():
+        bash = shutil.which("bash")
+        if not bash:
             raise RuntimeError(
-                "Claude Code's Windows Node entrypoint could not be resolved; "
-                "refusing to use the npm CMD shim or fall back to Hermes/Codex"
+                "Claude Code resolves to a Windows CMD shim but bash is unavailable; "
+                "cannot execute literal `claude -p` and will not fall back"
             )
-        return [node, str(cli_js)]
+        # Git Bash resolves npm's extensionless POSIX shim, which safely forwards
+        # stdin and all following argv to Claude Code. The fixed shell fragment
+        # keeps task content out of command-string interpolation.
+        return [bash, "-lc", 'exec claude "$@"', "claude"]
     return [claude]
 
 
