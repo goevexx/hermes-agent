@@ -2580,7 +2580,18 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     ``complete`` / ``block`` transitions. ``board`` pins the child's
     ``HERMES_KANBAN_DB`` / ``HERMES_KANBAN_BOARD`` / workspaces_root to the
     board the task was claimed from, so workers cannot see other boards.
+
+    Tower-routed tasks (``classify_for_tower`` returns ``True``) are dispatched
+    via :func:`hermes_cli.kanban_tower_router.spawn_tower_supervisor` and bypass
+    the normal profile/backend path entirely. This enforces the no-double-graph
+    invariant: Hermes creates exactly one Tower supervisor process and no
+    competing leaf Kanban tasks.
     """
+    from hermes_cli.kanban_tower_router import classify_for_tower, spawn_tower_supervisor
+
+    if classify_for_tower(task):
+        return spawn_tower_supervisor(task, workspace, board=board)
+
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
 
