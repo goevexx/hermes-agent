@@ -706,19 +706,35 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
     when the task carries no per-task skills.
 
     We intercept Popen to capture the argv without actually spawning a
-    hermes subprocess (which would hang trying to call an LLM).
+    subprocess (which would hang trying to call an LLM).
     """
     captured = {}
 
+    class FakeStdin:
+        def write(self, data):
+            captured["prompt"] = data
+
+        def close(self):
+            pass
+
     class FakeProc:
-        def __init__(self):
-            self.pid = 99999
+        pid = 99999
+        stdin = FakeStdin()
 
     def fake_popen(cmd, **kwargs):
         captured["cmd"] = cmd
         captured["env"] = kwargs.get("env", {})
         return FakeProc()
 
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {
+            "worker_backend": "claude_cli",
+            "claude_cli_model": "sonnet",
+            "claude_cli_permission_mode": "auto",
+        }},
+    )
+    monkeypatch.setattr(kbd, "_resolve_claude_cli_argv", lambda: ["fake-claude"])
     monkeypatch.setattr("subprocess.Popen", fake_popen)
 
     conn = kbc.connect()
@@ -736,12 +752,11 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
     assert "--skills" not in cmd, (
         f"spawn argv should not auto-load any skill: {cmd}"
     )
-    assert "--accept-hooks" in cmd, f"spawn argv missing --accept-hooks: {cmd}"
-    assert cmd.index("--accept-hooks") < cmd.index("chat"), (
-        f"--accept-hooks must come before 'chat' in argv: {cmd}"
+    # claude_cli uses -p (print/non-interactive) flag, not hermes's --accept-hooks
+    assert "-p" in cmd, f"claude -p flag must be present: {cmd}"
+    assert "--hermes" not in " ".join(cmd), (
+        f"spawn argv must not use hermes binary: {cmd}"
     )
-    # Assignee + task env are still present
-    assert "some-profile" in cmd
     env = captured["env"]
     assert env.get("HERMES_KANBAN_TASK") == tid
     assert env.get("HERMES_PROFILE") == "some-profile"
@@ -802,7 +817,7 @@ def test_unknown_worker_backend_fails_closed(monkeypatch):
         "hermes_cli.config.load_config",
         lambda: {"kanban": {"worker_backend": "openai-codex"}},
     )
-    with pytest.raises(RuntimeError, match="refusing to fall back"):
+    with pytest.raises(RuntimeError, match="only claude_cli is permitted"):
         kbd._worker_backend_config()
 
 

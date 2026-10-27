@@ -272,7 +272,7 @@ class TestCodexGuard:
             "hermes_cli.config.load_config",
             lambda: {"kanban": {"worker_backend": "codex"}},
         )
-        with pytest.raises(RuntimeError, match="refusing to fall back"):
+        with pytest.raises(RuntimeError, match="only claude_cli is permitted"):
             kbd._worker_backend_config()
 
     def test_openai_codex_backend_refused(self, monkeypatch):
@@ -280,7 +280,7 @@ class TestCodexGuard:
             "hermes_cli.config.load_config",
             lambda: {"kanban": {"worker_backend": "openai-codex"}},
         )
-        with pytest.raises(RuntimeError, match="refusing to fall back"):
+        with pytest.raises(RuntimeError, match="only claude_cli is permitted"):
             kbd._worker_backend_config()
 
 
@@ -402,3 +402,184 @@ class TestFailClosed:
         assert "--print" not in cmd, "legacy --print flag must not be used"
         prompt = captured.get("prompt", b"").decode("utf-8")
         assert "/tower" in prompt, "Literal /tower must appear in the prompt sent to Claude Code"
+
+
+# ===========================================================================
+# Regression tests: all-path Codex guard (t_a8262bd1)
+# ===========================================================================
+
+class TestCodexGuardRegressions:
+    """Explicit regression coverage for the defects found in t_a8262bd1.
+
+    Each test sets one of the forbidden configurations and asserts that no
+    Hermes/Codex worker argv or process is produced.
+    """
+
+    # -----------------------------------------------------------------------
+    # _worker_backend_config() must reject the legacy "hermes" value
+    # -----------------------------------------------------------------------
+
+    def test_hermes_backend_rejected(self, monkeypatch):
+        """worker_backend=hermes must now raise, not spawn a Hermes worker."""
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"kanban": {"worker_backend": "hermes"}},
+        )
+        with pytest.raises(RuntimeError, match="only claude_cli is permitted"):
+            kbd._worker_backend_config()
+
+    def test_hermes_backend_default_is_now_claude_cli(self, monkeypatch):
+        """Omitting worker_backend defaults to claude_cli, not hermes."""
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"kanban": {}},
+        )
+        backend, _, _ = kbd._worker_backend_config()
+        assert backend == "claude_cli"
+
+    # -----------------------------------------------------------------------
+    # provider_override=openai-codex must block before Popen
+    # -----------------------------------------------------------------------
+
+    def test_provider_override_openai_codex_blocked(self, kanban_home, monkeypatch):
+        """provider_override=openai-codex must not produce a worker process."""
+        spawn_calls: list[str] = []
+
+        class FakeProc:
+            pid = 99991
+            stdin = None
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"kanban": {"worker_backend": "claude_cli"}},
+        )
+        monkeypatch.setattr(kbd, "_resolve_claude_cli_argv", lambda: ["fake-claude"])
+        import subprocess as sp
+        monkeypatch.setattr(
+            sp, "Popen",
+            lambda *a, **kw: (spawn_calls.append("spawned") or FakeProc()),
+        )
+
+        with kbc.connect_closing() as conn:
+            tid = kb.create_task(
+                conn,
+                title="Task with Codex provider override",
+                assignee="researcher",
+                provider_override="openai-codex",
+                model_override="codex-latest",
+            )
+            task = kb.get_task(conn, tid)
+        assert task is not None
+        workspace = str(kbw.resolve_workspace(task))
+
+        with pytest.raises(RuntimeError, match="Codex is fail-closed"):
+            kbd._default_spawn(task, workspace)
+
+        assert len(spawn_calls) == 0, "No process must be spawned with Codex provider override"
+
+    # -----------------------------------------------------------------------
+    # model_override=gpt-5.6-sol must block before Popen
+    # -----------------------------------------------------------------------
+
+    def test_model_override_gpt_blocked(self, kanban_home, monkeypatch):
+        """model_override=gpt-5.6-sol must not produce a worker process."""
+        spawn_calls: list[str] = []
+
+        class FakeProc:
+            pid = 99992
+            stdin = None
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"kanban": {"worker_backend": "claude_cli"}},
+        )
+        monkeypatch.setattr(kbd, "_resolve_claude_cli_argv", lambda: ["fake-claude"])
+        import subprocess as sp
+        monkeypatch.setattr(
+            sp, "Popen",
+            lambda *a, **kw: (spawn_calls.append("spawned") or FakeProc()),
+        )
+
+        with kbc.connect_closing() as conn:
+            tid = kb.create_task(
+                conn,
+                title="Task with GPT model override",
+                assignee="researcher",
+                model_override="gpt-5.6-sol",
+            )
+            task = kb.get_task(conn, tid)
+        assert task is not None
+        workspace = str(kbw.resolve_workspace(task))
+
+        with pytest.raises(RuntimeError, match="Codex is fail-closed"):
+            kbd._default_spawn(task, workspace)
+
+        assert len(spawn_calls) == 0, "No process must be spawned with GPT model override"
+
+    # -----------------------------------------------------------------------
+    # provider_override=openrouter must block (OpenRouter is JEV-only)
+    # -----------------------------------------------------------------------
+
+    def test_openrouter_provider_blocked_in_kanban(self, kanban_home, monkeypatch):
+        """provider_override=openrouter must not produce a worker process."""
+        spawn_calls: list[str] = []
+
+        class FakeProc:
+            pid = 99993
+            stdin = None
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"kanban": {"worker_backend": "claude_cli"}},
+        )
+        monkeypatch.setattr(kbd, "_resolve_claude_cli_argv", lambda: ["fake-claude"])
+        import subprocess as sp
+        monkeypatch.setattr(
+            sp, "Popen",
+            lambda *a, **kw: (spawn_calls.append("spawned") or FakeProc()),
+        )
+
+        with kbc.connect_closing() as conn:
+            tid = kb.create_task(
+                conn,
+                title="Task with OpenRouter provider",
+                assignee="researcher",
+                provider_override="openrouter",
+                model_override="anthropic/claude-sonnet-4-5",
+            )
+            task = kb.get_task(conn, tid)
+        assert task is not None
+        workspace = str(kbw.resolve_workspace(task))
+
+        with pytest.raises(RuntimeError, match="Codex is fail-closed"):
+            kbd._default_spawn(task, workspace)
+
+        assert len(spawn_calls) == 0, "OpenRouter must not spawn a Kanban worker"
+
+    # -----------------------------------------------------------------------
+    # Verify _worker_argv is unreachable: hermes backend is fully dead
+    # -----------------------------------------------------------------------
+
+    def test_no_hermes_worker_argv_producible(self, monkeypatch):
+        """_worker_argv must never be called by _worker_backend_config + dispatch.
+
+        Setting worker_backend=hermes must raise before _worker_argv is
+        reached, producing no hermes worker command.
+        """
+        hermes_argv_calls: list[str] = []
+        original_worker_argv = kbd._worker_argv
+
+        def spy_worker_argv(*args, **kwargs):
+            hermes_argv_calls.append("called")
+            return original_worker_argv(*args, **kwargs)
+
+        monkeypatch.setattr(kbd, "_worker_argv", spy_worker_argv)
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"kanban": {"worker_backend": "hermes"}},
+        )
+
+        with pytest.raises(RuntimeError, match="only claude_cli is permitted"):
+            kbd._worker_backend_config()
+
+        assert len(hermes_argv_calls) == 0, "_worker_argv must never be reached via hermes backend"

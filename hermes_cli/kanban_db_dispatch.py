@@ -2448,11 +2448,11 @@ def _worker_backend_config() -> tuple[str, str, str]:
         kanban_cfg = load_config().get("kanban") or {}
     except Exception as exc:
         raise RuntimeError(f"could not load Kanban worker backend config: {exc}") from exc
-    backend = str(kanban_cfg.get("worker_backend") or "hermes").strip().lower()
-    if backend not in {"hermes", "claude_cli"}:
+    backend = str(kanban_cfg.get("worker_backend") or "claude_cli").strip().lower()
+    if backend != "claude_cli":
         raise RuntimeError(
             f"unsupported kanban.worker_backend {backend!r}; "
-            "refusing to fall back to a model provider"
+            "only claude_cli is permitted — refusing to use hermes, Codex or any other provider"
         )
     model = str(kanban_cfg.get("claude_cli_model") or "sonnet").strip()
     permission_mode = str(
@@ -2572,6 +2572,39 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
     ).argv
 
 
+# Providers that must never appear as kanban.provider_override values.
+_FORBIDDEN_KANBAN_PROVIDERS = frozenset({
+    "openai", "openai-codex", "openrouter", "codex", "azure-openai",
+    "azure", "anthropic-bedrock", "vertex-ai",
+})
+
+# Model-name prefixes that identify non-Claude models.
+_FORBIDDEN_KANBAN_MODEL_PREFIXES = ("gpt-", "o1-", "o3-", "o4-", "codex-", "text-davinci")
+
+
+def _reject_non_claude_overrides(task: "Task") -> None:
+    """Raise RuntimeError (via assert_codex_blocked) if the task's
+    model_override or provider_override names a non-Claude backend.
+
+    This is the second line of defence after _worker_backend_config() already
+    blocks the hermes backend. It prevents a task row with
+    provider_override=openai-codex / model_override=gpt-* from ever reaching
+    Popen, regardless of which backend is configured.
+    """
+    from hermes_cli.kanban_tower_router import assert_codex_blocked
+
+    prov = (getattr(task, "provider_override", None) or "").strip().lower()
+    if prov and (
+        prov in _FORBIDDEN_KANBAN_PROVIDERS
+        or prov.startswith(("openai", "openrouter", "codex", "gpt", "azure"))
+    ):
+        assert_codex_blocked()
+
+    model = (getattr(task, "model_override", None) or "").strip().lower()
+    if model and any(model.startswith(p) for p in _FORBIDDEN_KANBAN_MODEL_PREFIXES):
+        assert_codex_blocked()
+
+
 def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -> Optional[int]:
     """Fire-and-forget configured Kanban worker subprocess.
 
@@ -2591,6 +2624,10 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
 
     if classify_for_tower(task):
         return spawn_tower_supervisor(task, workspace, board=board)
+
+    # Fail-closed: block any task whose model/provider overrides name a
+    # non-Claude backend before touching the process layer.
+    _reject_non_claude_overrides(task)
 
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
@@ -2701,7 +2738,13 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         cmd = _claude_worker_argv(claude_model, claude_permission_mode)
         claude_prompt = _claude_worker_prompt(task, board, workspace).encode("utf-8")
     else:
-        cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
+        # Unreachable: _worker_backend_config() rejects every backend other
+        # than claude_cli. assert_codex_blocked() is called here as an
+        # explicit belt-and-suspenders guard so any future regression that
+        # reaches this branch fails loudly rather than spawning a non-Claude
+        # worker silently.
+        from hermes_cli.kanban_tower_router import assert_codex_blocked
+        assert_codex_blocked()
     # A worker spawned by a managed systemd gateway must leave the gateway's
     # cgroup before startup; otherwise restarting the service kills the worker
     # that is performing the handoff.
